@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "mctun",
+  "version": "${version}",
+  "name": "MCTun",
+  "description": "High-performance SOCKS5 tunneling over a Minecraft Fabric client/server connection.",
+  "authors": [
+    "MCTun contributors"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "dev.mctun.MctunMod"
+    ],
+    "client": [
+      "dev.mctun.client.MctunClientMod"
+    ],
+    "server": [
+      "dev.mctun.server.MctunServerMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
