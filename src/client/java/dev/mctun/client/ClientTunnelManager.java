@@ -2,15 +2,17 @@ package dev.mctun.client;
 
 import dev.mctun.MctunMod;
 import dev.mctun.config.ClientConfig;
+import dev.mctun.metrics.TunnelMetrics;
 import dev.mctun.net.NettyResources;
 import dev.mctun.protocol.TunnelFrame;
 import dev.mctun.protocol.TunnelFrameType;
+import dev.mctun.socks.SocksAddresses;
 import dev.mctun.socks.UdpFragmentReassembler;
 import dev.mctun.socks.UdpSocksPacket;
+import dev.mctun.transport.FrameSender;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
@@ -40,24 +42,42 @@ import io.netty.handler.codec.socksx.v5.Socks5PasswordAuthStatus;
 import io.netty.handler.codec.socksx.v5.Socks5ServerEncoder;
 
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class ClientTunnelManager {
+    private static final int UDP_PENDING_LIMIT = 1024;
+
     private final ClientConfig config;
-    private final ClientTunnelTransport transport;
+    private final FrameSender transport;
+    private final TunnelMetrics metrics = new TunnelMetrics();
     private final AtomicInteger nextStreamId = new AtomicInteger(1);
     private final Map<Integer, LocalStream> streams = new ConcurrentHashMap<>();
     private final AtomicBoolean started = new AtomicBoolean();
+    private final AtomicLong globalOutboundPending = new AtomicLong();
 
     private NettyResources netty;
     private Channel listener;
 
-    public ClientTunnelManager(ClientConfig config, ClientTunnelTransport transport) {
+    public ClientTunnelManager(ClientConfig config, FrameSender transport) {
         this.config = config;
         this.transport = transport;
+    }
+
+    public TunnelMetrics metrics() {
+        return metrics;
+    }
+
+    public InetSocketAddress boundAddress() {
+        if (listener == null || listener.localAddress() == null) {
+            return null;
+        }
+        SocketAddress address = listener.localAddress();
+        return address instanceof InetSocketAddress inet ? inet : null;
     }
 
     public void start() {
@@ -131,8 +151,9 @@ public final class ClientTunnelManager {
         switch (frame.type()) {
             case TCP_DATA -> stream.write(frame.payload());
             case UDP_DATAGRAM -> stream.writeUdp(frame);
+            case WINDOW_UPDATE -> stream.onWindowUpdate(frame.code());
             case CLOSE, ERROR -> stream.close();
-            case WINDOW_UPDATE, HELLO, OPEN_TCP, OPEN_BIND, BIND_ACCEPTED, OPEN_UDP -> {
+            case HELLO, OPEN_TCP, OPEN_BIND, BIND_ACCEPTED, OPEN_UDP -> {
             }
         }
     }
@@ -201,9 +222,14 @@ public final class ClientTunnelManager {
             streamId = nextStreamId.getAndIncrement();
             LocalStream stream = new LocalStream(streamId, ctx.channel(), request);
             streams.put(streamId, stream);
+            metrics.streamOpened();
             ctx.channel().closeFuture().addListener(future -> {
-                streams.remove(streamId);
-                transport.send(TunnelFrame.close(streamId, 0, "local channel closed"));
+                LocalStream removed = streams.remove(streamId);
+                if (removed != null) {
+                    removed.closeResources();
+                    transport.send(TunnelFrame.close(streamId, 0, "local channel closed"));
+                    metrics.streamClosed();
+                }
             });
 
             if (request.type() == Socks5CommandType.CONNECT) {
@@ -230,7 +256,10 @@ public final class ClientTunnelManager {
                 if (streamId == 0 || !buf.isReadable()) {
                     return;
                 }
-                transport.send(TunnelFrame.tcpData(streamId, ByteBufUtil.getBytes(buf)));
+                LocalStream stream = streams.get(streamId);
+                if (stream != null) {
+                    stream.sendTcpData(ctx, buf);
+                }
             } finally {
                 buf.release();
             }
@@ -251,6 +280,9 @@ public final class ClientTunnelManager {
         private final int id;
         private final Channel channel;
         private final Socks5CommandRequest request;
+        private final AtomicInteger outboundPending = new AtomicInteger();
+        private final AtomicBoolean readPaused = new AtomicBoolean();
+        private final AtomicBoolean closed = new AtomicBoolean();
         private UdpRelay udpRelay;
 
         private LocalStream(int id, Channel channel, Socks5CommandRequest request) {
@@ -268,7 +300,7 @@ public final class ClientTunnelManager {
                 replyHost = local.getAddress() == null ? local.getHostString() : local.getAddress().getHostAddress();
                 replyPort = local.getPort();
             }
-            channel.writeAndFlush(new DefaultSocks5CommandResponse(status, replyAddressType(request), replyHost, replyPort))
+            channel.writeAndFlush(new DefaultSocks5CommandResponse(status, replyAddressType(replyHost), replyHost, replyPort))
                     .addListener(future -> {
                         if (future.isSuccess() && status == Socks5CommandStatus.SUCCESS && request.type() == Socks5CommandType.CONNECT) {
                             removeSocksDecoders(channel);
@@ -284,7 +316,7 @@ public final class ClientTunnelManager {
         }
 
         void onBindAccepted(TunnelFrame frame) {
-            channel.writeAndFlush(new DefaultSocks5CommandResponse(Socks5CommandStatus.SUCCESS, replyAddressType(request), frame.host(), frame.port()))
+            channel.writeAndFlush(new DefaultSocks5CommandResponse(Socks5CommandStatus.SUCCESS, replyAddressType(frame.host()), frame.host(), frame.port()))
                     .addListener(future -> {
                         if (future.isSuccess()) {
                             removeSocksDecoders(channel);
@@ -296,13 +328,19 @@ public final class ClientTunnelManager {
         }
 
         void closeWithStatus(Socks5CommandStatus status) {
-            channel.writeAndFlush(new DefaultSocks5CommandResponse(status, replyAddressType(request), "0.0.0.0", 0))
+            channel.writeAndFlush(new DefaultSocks5CommandResponse(status, Socks5AddressType.IPv4, "0.0.0.0", 0))
                     .addListener(ChannelFutureListener.CLOSE);
         }
 
         void write(byte[] bytes) {
             if (channel.isActive()) {
-                channel.writeAndFlush(Unpooled.wrappedBuffer(bytes));
+                metrics.bytesIn(bytes.length);
+                channel.writeAndFlush(Unpooled.wrappedBuffer(bytes))
+                        .addListener(future -> {
+                            if (future.isSuccess()) {
+                                transport.send(TunnelFrame.windowUpdate(id, bytes.length));
+                            }
+                        });
             }
         }
 
@@ -324,13 +362,51 @@ public final class ClientTunnelManager {
                     });
             Channel udpChannel = bootstrap.bind(config.listenHost(), 0).syncUninterruptibly().channel();
             udpRelay = new UdpRelay(udpChannel);
+            metrics.udpAssociationOpened();
         }
 
         void close() {
+            if (closed.compareAndSet(false, true)) {
+                streams.remove(id);
+                closeResources();
+                metrics.streamClosed();
+            }
+        }
+
+        void closeResources() {
             if (udpRelay != null) {
                 udpRelay.close();
+                udpRelay = null;
+                metrics.udpAssociationClosed();
             }
+            releaseOutboundPending(outboundPending.getAndSet(0));
             channel.close();
+        }
+
+        void sendTcpData(ChannelHandlerContext ctx, ByteBuf buf) {
+            while (buf.isReadable()) {
+                int length = Math.min(buf.readableBytes(), config.chunkSize());
+                byte[] bytes = new byte[length];
+                buf.readBytes(bytes);
+                outboundPending.addAndGet(length);
+                globalOutboundPending.addAndGet(length);
+                metrics.bytesOut(length);
+                transport.send(TunnelFrame.tcpData(id, bytes));
+            }
+            pauseIfNeeded(ctx.channel());
+        }
+
+        void onWindowUpdate(int bytes) {
+            int released = Math.max(0, Math.min(bytes, outboundPending.get()));
+            if (released == 0) {
+                return;
+            }
+            outboundPending.addAndGet(-released);
+            releaseOutboundPending(released);
+            if (readPaused.get() && belowResumeThreshold()) {
+                readPaused.set(false);
+                channel.config().setAutoRead(true);
+            }
         }
 
         private void removeSocksDecoders(Channel channel) {
@@ -339,13 +415,28 @@ public final class ClientTunnelManager {
             }
         }
 
-        private Socks5AddressType replyAddressType(Socks5CommandRequest request) {
-            return request.dstAddrType();
+        private Socks5AddressType replyAddressType(String host) {
+            return SocksAddresses.typeForHost(host);
+        }
+
+        private void pauseIfNeeded(Channel channel) {
+            if (outboundPending.get() >= config.streamWindowBytes() || globalOutboundPending.get() >= config.globalPendingBytes()) {
+                if (readPaused.compareAndSet(false, true)) {
+                    metrics.windowPause();
+                    channel.config().setAutoRead(false);
+                }
+            }
+        }
+
+        private boolean belowResumeThreshold() {
+            return outboundPending.get() < config.streamWindowBytes() / 2
+                    && globalOutboundPending.get() < config.globalPendingBytes() / 2;
         }
     }
 
     private final class UdpRelay {
         private final Channel channel;
+        private final AtomicInteger pendingDatagrams = new AtomicInteger();
         private volatile InetSocketAddress applicationAddress;
 
         private UdpRelay(Channel channel) {
@@ -361,8 +452,14 @@ public final class ClientTunnelManager {
             if (recipient == null || !channel.isActive()) {
                 return;
             }
-            UdpSocksPacket packet = new UdpSocksPacket(0, io.netty.handler.codec.socksx.v5.Socks5AddressType.DOMAIN, frame.host(), frame.port(), frame.payload());
-            channel.writeAndFlush(new DatagramPacket(packet.toByteBuf(), recipient));
+            if (pendingDatagrams.incrementAndGet() > UDP_PENDING_LIMIT) {
+                pendingDatagrams.decrementAndGet();
+                metrics.droppedUdpDatagram();
+                return;
+            }
+            UdpSocksPacket packet = UdpSocksPacket.fromHost(0, frame.host(), frame.port(), frame.payload());
+            channel.writeAndFlush(new DatagramPacket(packet.toByteBuf(), recipient))
+                    .addListener(future -> pendingDatagrams.decrementAndGet());
         }
 
         void close() {
@@ -387,13 +484,34 @@ public final class ClientTunnelManager {
                 if (stream == null) {
                     return;
                 }
+                if (stream.udpRelay == null) {
+                    return;
+                }
                 stream.udpRelay.remember(packet.sender());
-                UdpSocksPacket socksPacket = UdpSocksPacket.read(packet.content());
-                reassembler.accept(socksPacket).ifPresent(payload ->
-                        transport.send(TunnelFrame.udpDatagram(streamId, socksPacket.host(), socksPacket.port(), payload)));
+                UdpSocksPacket socksPacket;
+                try {
+                    socksPacket = UdpSocksPacket.read(packet.content());
+                } catch (IllegalArgumentException ex) {
+                    metrics.malformedUdpDatagram();
+                    return;
+                }
+                UdpFragmentReassembler.Result result = reassembler.acceptPacket(socksPacket);
+                if (result.status() == UdpFragmentReassembler.Status.COMPLETE) {
+                    byte[] payload = result.payload();
+                    metrics.bytesOut(payload.length);
+                    transport.send(TunnelFrame.udpDatagram(streamId, socksPacket.host(), socksPacket.port(), payload));
+                } else if (result.status() == UdpFragmentReassembler.Status.DROPPED) {
+                    metrics.droppedUdpDatagram();
+                }
             } finally {
                 packet.release();
             }
+        }
+    }
+
+    private void releaseOutboundPending(int bytes) {
+        if (bytes > 0) {
+            globalOutboundPending.addAndGet(-bytes);
         }
     }
 }

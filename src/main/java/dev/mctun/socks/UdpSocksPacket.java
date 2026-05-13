@@ -9,6 +9,10 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 
 public record UdpSocksPacket(int fragment, Socks5AddressType addressType, String host, int port, byte[] payload) {
+    public static UdpSocksPacket fromHost(int fragment, String host, int port, byte[] payload) {
+        return new UdpSocksPacket(fragment, SocksAddresses.typeForHost(host), host, port, payload);
+    }
+
     public static UdpSocksPacket read(ByteBuf buf) {
         if (buf.readableBytes() < 4) {
             throw new IllegalArgumentException("SOCKS5 UDP packet too short");

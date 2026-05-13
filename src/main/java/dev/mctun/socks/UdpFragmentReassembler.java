@@ -5,6 +5,26 @@ import java.time.Clock;
 import java.util.Optional;
 
 public final class UdpFragmentReassembler {
+    public enum Status {
+        COMPLETE,
+        PENDING,
+        DROPPED
+    }
+
+    public record Result(Status status, byte[] payload) {
+        public static Result complete(byte[] payload) {
+            return new Result(Status.COMPLETE, payload);
+        }
+
+        public static Result pending() {
+            return new Result(Status.PENDING, new byte[0]);
+        }
+
+        public static Result dropped() {
+            return new Result(Status.DROPPED, new byte[0]);
+        }
+    }
+
     private final int timeoutMillis;
     private final int maxBytes;
     private final Clock clock;
@@ -23,10 +43,15 @@ public final class UdpFragmentReassembler {
     }
 
     public Optional<byte[]> accept(UdpSocksPacket packet) {
+        Result result = acceptPacket(packet);
+        return result.status() == Status.COMPLETE ? Optional.of(result.payload()) : Optional.empty();
+    }
+
+    public Result acceptPacket(UdpSocksPacket packet) {
         int fragment = packet.fragment();
         if (fragment == 0) {
             reset();
-            return Optional.of(packet.payload());
+            return Result.complete(packet.payload());
         }
 
         boolean last = (fragment & 0x80) != 0;
@@ -40,12 +65,12 @@ public final class UdpFragmentReassembler {
         }
         if (index != expectedFragment) {
             reset();
-            return Optional.empty();
+            return Result.dropped();
         }
 
         if (buffer.size() + packet.payload().length > maxBytes) {
             reset();
-            return Optional.empty();
+            return Result.dropped();
         }
 
         buffer.writeBytes(packet.payload());
@@ -54,9 +79,9 @@ public final class UdpFragmentReassembler {
         if (last) {
             byte[] bytes = buffer.toByteArray();
             reset();
-            return Optional.of(bytes);
+            return Result.complete(bytes);
         }
-        return Optional.empty();
+        return Result.pending();
     }
 
     private void reset() {
