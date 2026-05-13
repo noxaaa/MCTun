@@ -21,12 +21,16 @@ Implemented:
 - SOCKS5 UDP header parsing and FRAG reassembly.
 - Minecraft custom payload tunnel frames.
 - Netty TCP/UDP outbound on the server.
+- Basic per-stream/global window backpressure for TCP.
+- Bounded pending UDP sends with drop/malformed counters.
+- In-memory transport for integration tests without launching Minecraft.
+- Unit and integration tests for core SOCKS5 flows.
 - Default server egress is open, per project requirement.
 
 Still intentionally simple:
 
-- Flow-control frame types exist, but adaptive backpressure/window accounting is not fully tuned yet.
-- UDP queues are functional but do not yet expose detailed drop metrics.
+- Flow control is basic window accounting; adaptive tuning and throughput benchmarking are still future work.
+- UDP exposes drop/malformed counters, but not a full metrics export surface.
 - Native kqueue/epoll selection is not wired yet; the implementation currently uses NIO transport.
 
 ## Build
