@@ -8,8 +8,11 @@ import net.fabricmc.api.DedicatedServerModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.server.network.ServerPlayNetworkHandler;
 
 public final class MctunServerMod implements DedicatedServerModInitializer {
+    private static volatile ServerTunnelManager activeManager;
+
     private ServerTunnelManager manager;
     private ServerTunnelTransport transport;
 
@@ -22,8 +25,9 @@ public final class MctunServerMod implements DedicatedServerModInitializer {
 
         transport = new ServerTunnelTransport();
         manager = new ServerTunnelManager(config, transport);
+        activeManager = manager;
         ServerPlayNetworking.registerGlobalReceiver(TunnelPayload.ID, (payload, context) ->
-                context.server().execute(() -> manager.receive(context.player().getUuid(), payload.frame())));
+                manager.receive(context.player().getUuid(), payload.frame()));
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> transport.register(handler.player));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
             manager.disconnect(handler.player.getUuid());
@@ -31,5 +35,14 @@ public final class MctunServerMod implements DedicatedServerModInitializer {
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> manager.shutdown());
         MctunMod.LOGGER.info("MCTun server initialized");
+    }
+
+    public static boolean handleTunnelPayload(ServerPlayNetworkHandler handler, TunnelPayload payload) {
+        ServerTunnelManager manager = activeManager;
+        if (manager == null) {
+            return false;
+        }
+        manager.receive(handler.player.getUuid(), payload.frame());
+        return true;
     }
 }

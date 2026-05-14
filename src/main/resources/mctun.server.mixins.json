@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "dev.mctun.server.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "server": [
+    "ClientConnectionServerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
