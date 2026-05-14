@@ -38,6 +38,7 @@ dependencies {
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
     implementation "io.netty:netty-codec-socks:${project.netty_version}"
+    include "io.netty:netty-codec-socks:${project.netty_version}"
     implementation "io.netty:netty-transport-native-kqueue:${project.netty_version}:osx-aarch_64"
 
     testImplementation platform("org.junit:junit-bom:5.10.3")
