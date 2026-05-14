@@ -9,18 +9,30 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 
 public final class MctunClientMod implements ClientModInitializer {
+    private static volatile ClientTunnelManager activeManager;
+
     private ClientTunnelManager manager;
 
     @Override
     public void onInitializeClient() {
         ClientConfig config = ConfigIo.loadClient();
         manager = new ClientTunnelManager(config, new ClientTunnelTransport());
+        activeManager = manager;
 
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> manager.start());
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> manager.stop());
         ClientPlayNetworking.registerGlobalReceiver(TunnelPayload.ID, (payload, context) ->
-                context.client().execute(() -> manager.receive(payload.frame())));
+                handleTunnelPayload(payload));
 
         MctunMod.LOGGER.info("MCTun client initialized");
+    }
+
+    public static boolean handleTunnelPayload(TunnelPayload payload) {
+        ClientTunnelManager manager = activeManager;
+        if (manager == null) {
+            return false;
+        }
+        manager.receive(payload.frame());
+        return true;
     }
 }

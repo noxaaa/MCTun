@@ -51,6 +51,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 public final class ClientTunnelManager {
     private static final int UDP_PENDING_LIMIT = 1024;
+    private static final int MAX_WINDOW_UPDATE_BATCH_BYTES = 32 * 1024;
 
     private final ClientConfig config;
     private final FrameSender transport;
@@ -281,6 +282,7 @@ public final class ClientTunnelManager {
         private final Channel channel;
         private final Socks5CommandRequest request;
         private final AtomicInteger outboundPending = new AtomicInteger();
+        private final AtomicInteger pendingWindowUpdate = new AtomicInteger();
         private final AtomicBoolean readPaused = new AtomicBoolean();
         private final AtomicBoolean closed = new AtomicBoolean();
         private UdpRelay udpRelay;
@@ -338,7 +340,7 @@ public final class ClientTunnelManager {
                 channel.writeAndFlush(Unpooled.wrappedBuffer(bytes))
                         .addListener(future -> {
                             if (future.isSuccess()) {
-                                transport.send(TunnelFrame.windowUpdate(id, bytes.length));
+                                acknowledgeWindowBytes(bytes.length);
                             }
                         });
             }
@@ -380,6 +382,7 @@ public final class ClientTunnelManager {
                 metrics.udpAssociationClosed();
             }
             releaseOutboundPending(outboundPending.getAndSet(0));
+            flushWindowUpdate();
             channel.close();
         }
 
@@ -431,6 +434,24 @@ public final class ClientTunnelManager {
         private boolean belowResumeThreshold() {
             return outboundPending.get() < config.streamWindowBytes() / 2
                     && globalOutboundPending.get() < config.globalPendingBytes() / 2;
+        }
+
+        private void acknowledgeWindowBytes(int bytes) {
+            int pending = pendingWindowUpdate.addAndGet(bytes);
+            if (pending >= windowUpdateThreshold()) {
+                flushWindowUpdate();
+            }
+        }
+
+        private void flushWindowUpdate() {
+            int bytes = pendingWindowUpdate.getAndSet(0);
+            if (bytes > 0) {
+                transport.send(TunnelFrame.windowUpdate(id, bytes));
+            }
+        }
+
+        private int windowUpdateThreshold() {
+            return Math.max(1, Math.min(MAX_WINDOW_UPDATE_BATCH_BYTES, config.streamWindowBytes() / 8));
         }
     }
 
