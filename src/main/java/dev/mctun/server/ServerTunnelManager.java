@@ -35,6 +35,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class ServerTunnelManager {
     private static final int UDP_PENDING_LIMIT = 1024;
+    private static final int MAX_WINDOW_UPDATE_BATCH_BYTES = 32 * 1024;
 
     private final ServerConfig config;
     private final ServerFrameSender transport;
@@ -226,6 +227,7 @@ public final class ServerTunnelManager {
         private final int streamId;
         private final Channel channel;
         private final AtomicInteger outboundPending = new AtomicInteger();
+        private final AtomicInteger pendingWindowUpdate = new AtomicInteger();
         private final AtomicBoolean readPaused = new AtomicBoolean();
 
         private RemoteStream(UUID playerId, int streamId, Channel channel) {
@@ -241,7 +243,7 @@ public final class ServerTunnelManager {
                 channel.writeAndFlush(Unpooled.wrappedBuffer(bytes))
                         .addListener(future -> {
                             if (future.isSuccess()) {
-                                transport.send(playerId, TunnelFrame.windowUpdate(streamId, bytes.length));
+                                acknowledgeWindowBytes(bytes.length);
                             }
                         });
             }
@@ -255,6 +257,7 @@ public final class ServerTunnelManager {
         @Override
         public void release() {
             releaseOutboundPending(outboundPending.getAndSet(0));
+            flushWindowUpdate();
         }
 
         @Override
@@ -291,6 +294,24 @@ public final class ServerTunnelManager {
         private boolean belowResumeThreshold() {
             return outboundPending.get() < config.streamWindowBytes() / 2
                     && globalOutboundPending.get() < config.globalPendingBytes() / 2;
+        }
+
+        private void acknowledgeWindowBytes(int bytes) {
+            int pending = pendingWindowUpdate.addAndGet(bytes);
+            if (pending >= windowUpdateThreshold()) {
+                flushWindowUpdate();
+            }
+        }
+
+        private void flushWindowUpdate() {
+            int bytes = pendingWindowUpdate.getAndSet(0);
+            if (bytes > 0) {
+                transport.send(playerId, TunnelFrame.windowUpdate(streamId, bytes));
+            }
+        }
+
+        private int windowUpdateThreshold() {
+            return Math.max(1, Math.min(MAX_WINDOW_UPDATE_BATCH_BYTES, config.streamWindowBytes() / 8));
         }
     }
 
