@@ -21,6 +21,16 @@
       "dev.mctun.server.MctunServerMod"
     ]
   },
+  "mixins": [
+    {
+      "config": "mctun.server.mixins.json",
+      "environment": "server"
+    },
+    {
+      "config": "mctun.client.mixins.json",
+      "environment": "client"
+    }
+  ],
   "depends": {
     "fabricloader": ">=0.16.0",
     "minecraft": "~1.21.1",
