@@ -5,24 +5,32 @@ import dev.mctun.config.ConfigIo;
 import dev.mctun.config.ClientConfig;
 import dev.mctun.protocol.TunnelPayload;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 
 public final class MctunClientMod implements ClientModInitializer {
     private static volatile ClientTunnelManager activeManager;
 
-    private ClientTunnelManager manager;
+    private ClientTunnelManager tunnelManager;
+    private DirectSocksManager directManager;
 
     @Override
     public void onInitializeClient() {
         ClientConfig config = ConfigIo.loadClient();
-        manager = new ClientTunnelManager(config, new ClientTunnelTransport());
-        activeManager = manager;
-
-        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> manager.start());
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> manager.stop());
-        ClientPlayNetworking.registerGlobalReceiver(TunnelPayload.ID, (payload, context) ->
-                handleTunnelPayload(payload));
+        if (config.mode() == ClientConfig.Mode.DIRECT) {
+            activeManager = null;
+            directManager = new DirectSocksManager(config);
+            directManager.start();
+            ClientLifecycleEvents.CLIENT_STOPPING.register(client -> directManager.stop());
+        } else {
+            tunnelManager = new ClientTunnelManager(config, new ClientTunnelTransport());
+            activeManager = tunnelManager;
+            ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> tunnelManager.start());
+            ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> tunnelManager.stop());
+            ClientPlayNetworking.registerGlobalReceiver(TunnelPayload.ID, (payload, context) ->
+                    handleTunnelPayload(payload));
+        }
 
         MctunMod.LOGGER.info("MCTun client initialized");
     }
